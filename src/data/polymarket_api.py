@@ -253,26 +253,35 @@ class PolymarketClient:
     def fetch_markets_page(
         self,
         limit: int = 100,
-        offset: int = 0,
-        active: Optional[bool] = True,
+        after_cursor: Optional[str] = None,
         closed: Optional[bool] = False,
-    ) -> list[dict]:
-        """Fetch a single page of raw market records from GET /markets."""
-        params: dict[str, Any] = {"limit": limit, "offset": offset}
-        if active is not None:
-            params["active"] = str(active).lower()
+    ) -> tuple[list[dict], Optional[str]]:
+        """Fetch a single page of raw market records from GET /markets/keyset.
+
+        Polymarket migrated Gamma's /markets endpoint to cursor-based
+        ("keyset") pagination. `offset` is no longer accepted beyond the
+        first couple thousand records and returns a 422 if you try to page
+        past that point — you must use `after_cursor` from the previous
+        response instead. Note there is also no `active` filter on this
+        endpoint; filter on the `active` field client-side after fetching
+        (see `fetch_all_markets`).
+
+        Returns (markets, next_cursor). `next_cursor` is None on the last page.
+        """
+        params: dict[str, Any] = {"limit": limit}
         if closed is not None:
             params["closed"] = str(closed).lower()
+        if after_cursor:
+            params["after_cursor"] = after_cursor
 
-        data = self._get("/markets", params=params)
+        data = self._get("/markets/keyset", params=params)
 
-        # Gamma has returned either a bare list or {"data": [...]} depending
-        # on endpoint/version, so handle both defensively.
-        if isinstance(data, dict) and "data" in data:
-            return data["data"]
-        if isinstance(data, list):
-            return data
-        raise PolymarketAPIError(f"Unexpected /markets response shape: {type(data)}")
+        if not isinstance(data, dict):
+            raise PolymarketAPIError(f"Unexpected /markets/keyset response shape: {type(data)}")
+
+        markets = data.get("markets", [])
+        next_cursor = data.get("next_cursor")
+        return markets, next_cursor
 
     def fetch_all_markets(
         self,
@@ -281,33 +290,44 @@ class PolymarketClient:
         page_size: int = 100,
         max_pages: Optional[int] = None,
     ) -> list[dict]:
-        """Paginate through GET /markets until an empty page (or max_pages)."""
+        """Paginate through GET /markets/keyset via cursor until the last page
+        (indicated by a missing `next_cursor`), or until `max_pages` is hit.
+
+        `active` is applied as a client-side filter after fetching, since the
+        keyset endpoint doesn't expose an `active` query parameter.
+        """
         all_markets: list[dict] = []
-        offset = 0
+        cursor: Optional[str] = None
         page_num = 0
 
         while True:
             page_num += 1
-            logger.info("Fetching markets page %d (offset=%d, limit=%d)...",
-                        page_num, offset, page_size)
-            page = self.fetch_markets_page(
-                limit=page_size, offset=offset, active=active, closed=closed
+            logger.info("Fetching markets page %d (cursor=%s, limit=%d)...",
+                        page_num, cursor, page_size)
+            page, next_cursor = self.fetch_markets_page(
+                limit=page_size, after_cursor=cursor, closed=closed
             )
             if not page:
                 break
 
             all_markets.extend(page)
-            offset += page_size
 
             if max_pages is not None and page_num >= max_pages:
                 break
-            if len(page) < page_size:
-                # Short page => last page.
+            if not next_cursor:
+                # Last page — Gamma omits next_cursor when done.
                 break
 
+            cursor = next_cursor
             time.sleep(self.request_delay)
 
-        logger.info("Fetched %d raw market records total.", len(all_markets))
+        if active is True:
+            all_markets = [m for m in all_markets if m.get("active") is True]
+        elif active is False:
+            all_markets = [m for m in all_markets if m.get("active") is False]
+
+        logger.info("Fetched %d raw market records total (after active filter).",
+                    len(all_markets))
         return all_markets
 
     def get_market(self, market_id: str) -> MarketSnapshot:
