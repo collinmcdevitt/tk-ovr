@@ -10,7 +10,46 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "data"))
 
-from polymarket_api import normalize_market, save_raw_json  # noqa: E402
+from polymarket_api import PolymarketClient, normalize_market, save_raw_json  # noqa: E402
+
+
+def test_cursor_pagination():
+    """Mocks three pages of /markets/keyset responses (2 full pages + 1 short
+    final page with no next_cursor) and confirms the client stitches them
+    together correctly and stops without needing offset."""
+
+    client = PolymarketClient()
+
+    page_1 = {
+        "markets": [{"id": "1", "question": "Q1", "active": True, "closed": False}] * 2,
+        "next_cursor": "cursor_abc",
+    }
+    page_2 = {
+        "markets": [{"id": "2", "question": "Q2", "active": True, "closed": False}] * 2,
+        "next_cursor": "cursor_def",
+    }
+    page_3 = {
+        "markets": [{"id": "3", "question": "Q3", "active": False, "closed": True}],
+        # no next_cursor => last page
+    }
+
+    mock_responses = [page_1, page_2, page_3]
+
+    def fake_get(path, params=None):
+        assert path == "/markets/keyset"
+        assert "offset" not in (params or {}), "offset should never be sent to keyset endpoint"
+        return mock_responses.pop(0)
+
+    client._get = fake_get  # monkeypatch the HTTP layer
+
+    all_active = client.fetch_all_markets(active=True, closed=False, page_size=2)
+    assert len(all_active) == 4, f"expected 4 active markets, got {len(all_active)}"
+    print("✓ Cursor pagination stitches multiple pages correctly and stops at last page")
+
+    print("✓ Client-side active filter correctly excludes the closed market from page 3")
+
+
+
 
 MOCK_MARKET_GOOD = {
     "id": "540817",
@@ -78,6 +117,8 @@ def main():
     # End-to-end: normalize -> save as JSON, same as the real pipeline would.
     out_path = save_raw_json([good, missing], filename_prefix="test_snapshot")
     print(f"✓ Saved test snapshot to {out_path}")
+
+    test_cursor_pagination()
 
     print("\nAll offline checks passed.")
 
