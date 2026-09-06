@@ -1,4 +1,4 @@
-ok """
+"""
 polymarket_api.py
 
 Milestone 1 of the Prediction Market Alpha Engine:
