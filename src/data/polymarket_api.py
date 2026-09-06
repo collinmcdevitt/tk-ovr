@@ -258,6 +258,8 @@ class PolymarketClient:
         end_date_min: Optional[str] = None,
         order: Optional[str] = None,
         ascending: Optional[bool] = None,
+        liquidity_num_min: Optional[float] = None,
+        volume_num_min: Optional[float] = None,
     ) -> tuple[list[dict], Optional[str]]:
         """Fetch a single page of raw market records from GET /markets/keyset.
 
@@ -269,12 +271,11 @@ class PolymarketClient:
 
         There's also no `active` query filter on this endpoint. `active`
         markets are a subset of non-`closed` ones, but Polymarket's non-closed
-        backlog is enormous (many old/perpetual markets are never formally
-        marked closed), so filtering `active` client-side *after* pulling
-        everything is too slow and pulls way more than you want. Instead,
-        pass `end_date_min` (ISO 8601) to filter server-side on markets that
-        haven't already resolved — that's what actually keeps the result set
-        small — then apply the `active` filter on top of that narrower set.
+        backlog is enormous — tens of thousands of short-lived recurring
+        markets (hourly crypto price bets, daily sports lines, etc.) are all
+        technically "active" at any given moment. Filtering by `end_date_min`
+        alone still leaves a huge set. `liquidity_num_min` / `volume_num_min`
+        are what actually narrow this down to markets worth analyzing.
 
         Returns (markets, next_cursor). `next_cursor` is None on the last page.
         """
@@ -289,6 +290,10 @@ class PolymarketClient:
             params["order"] = order
         if ascending is not None:
             params["ascending"] = str(ascending).lower()
+        if liquidity_num_min is not None:
+            params["liquidity_num_min"] = liquidity_num_min
+        if volume_num_min is not None:
+            params["volume_num_min"] = volume_num_min
 
         data = self._get("/markets/keyset", params=params)
 
@@ -306,7 +311,9 @@ class PolymarketClient:
         page_size: int = 100,
         max_pages: Optional[int] = None,
         end_date_min: Optional[str] = "now",
-        hard_page_cap: int = 500,
+        hard_page_cap: int = 100,
+        liquidity_num_min: Optional[float] = None,
+        volume_num_min: Optional[float] = None,
     ) -> list[dict]:
         """Paginate through GET /markets/keyset via cursor until the last page
         (indicated by a missing `next_cursor`), `max_pages` is hit, or the
@@ -314,13 +321,15 @@ class PolymarketClient:
         enormous result set or an API pagination bug looping forever).
 
         `end_date_min="now"` (the default) filters server-side to markets
-        that haven't already resolved — this is what keeps the fetch fast
-        and the result set reasonably sized. Pass `end_date_min=None` to
-        disable this and pull the full historical catalog (slow — tens of
-        thousands of records).
+        that haven't already resolved. On its own this still leaves tens of
+        thousands of short-lived recurring markets, so `liquidity_num_min`
+        and/or `volume_num_min` are the filters that actually get you down
+        to a research-worthy set — pass at least one of these for any real
+        pull. Results are ordered by volume (descending) so if you do hit a
+        page cap, you keep the most active markets rather than an arbitrary
+        slice.
 
-        `active` is applied as a client-side filter on top of that, since the
-        keyset endpoint doesn't expose an `active` query parameter directly.
+        `active` is applied as a client-side filter on top of the above.
         """
         if end_date_min == "now":
             end_date_min = datetime.now(timezone.utc).isoformat()
@@ -334,8 +343,8 @@ class PolymarketClient:
             if page_num > hard_page_cap:
                 logger.warning(
                     "Hit hard_page_cap=%d pages (%d records so far) — stopping early. "
-                    "Pass a smaller max_pages, or narrow with end_date_min/liquidity "
-                    "filters if you expected fewer results.",
+                    "Pass a smaller max_pages, or narrow further with "
+                    "liquidity_num_min/volume_num_min if you expected fewer results.",
                     hard_page_cap, len(all_markets),
                 )
                 break
@@ -344,7 +353,8 @@ class PolymarketClient:
                         page_num, cursor, page_size, len(all_markets))
             page, next_cursor = self.fetch_markets_page(
                 limit=page_size, after_cursor=cursor, closed=closed,
-                end_date_min=end_date_min,
+                end_date_min=end_date_min, order="volume_num", ascending=False,
+                liquidity_num_min=liquidity_num_min, volume_num_min=volume_num_min,
             )
             if not page:
                 break
@@ -383,12 +393,15 @@ class PolymarketClient:
         page_size: int = 100,
         max_pages: Optional[int] = None,
         end_date_min: Optional[str] = "now",
-        hard_page_cap: int = 500,
+        hard_page_cap: int = 100,
+        liquidity_num_min: Optional[float] = None,
+        volume_num_min: Optional[float] = None,
     ) -> list[MarketSnapshot]:
         """Fetch markets and return them as normalized MarketSnapshot objects."""
         raw_markets = self.fetch_all_markets(
             active=active, closed=closed, page_size=page_size, max_pages=max_pages,
             end_date_min=end_date_min, hard_page_cap=hard_page_cap,
+            liquidity_num_min=liquidity_num_min, volume_num_min=volume_num_min,
         )
         snapshots = []
         for rm in raw_markets:
@@ -560,14 +573,22 @@ def main():
     parser.add_argument("--page-size", type=int, default=100)
     parser.add_argument("--max-pages", type=int, default=None,
                          help="Cap the number of pages fetched (useful for testing)")
-    parser.add_argument("--hard-page-cap", type=int, default=500,
+    parser.add_argument("--hard-page-cap", type=int, default=100,
                          help="Safety limit on total pages fetched, regardless of "
                               "--max-pages, to avoid an accidental runaway fetch "
-                              "(default: 500, i.e. up to 50,000 raw records)")
+                              "(default: 100, i.e. up to 10,000 raw records)")
     parser.add_argument("--full-history", action="store_true",
                          help="Disable the end_date_min filter and pull the ENTIRE "
                               "historical market catalog (tens of thousands of "
                               "records, many already resolved). Slow — off by default.")
+    parser.add_argument("--min-liquidity", type=float, default=1000.0,
+                         help="Only fetch markets with at least this much liquidity "
+                              "(default: 1000). Polymarket has tens of thousands of "
+                              "near-zero-liquidity markets that aren't worth analyzing "
+                              "— this is the main filter keeping your pull sane. Pass "
+                              "0 to disable.")
+    parser.add_argument("--min-volume", type=float, default=None,
+                         help="Only fetch markets with at least this much total volume.")
     parser.add_argument("--to-postgres", action="store_true",
                          help="Also write to Postgres (requires DATABASE_URL env var)")
     parser.add_argument("--output-dir", type=str, default=str(DEFAULT_RAW_DIR))
@@ -578,6 +599,7 @@ def main():
     active_filter = None if args.include_closed else True
     closed_filter = None if args.include_closed else False
     end_date_min = None if args.full_history else "now"
+    liquidity_num_min = None if args.min_liquidity == 0 else args.min_liquidity
 
     markets = client.get_markets(
         active=active_filter,
@@ -586,6 +608,8 @@ def main():
         max_pages=args.max_pages,
         end_date_min=end_date_min,
         hard_page_cap=args.hard_page_cap,
+        liquidity_num_min=liquidity_num_min,
+        volume_num_min=args.min_volume,
     )
 
     if not markets:
