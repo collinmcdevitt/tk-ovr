@@ -255,6 +255,9 @@ class PolymarketClient:
         limit: int = 100,
         after_cursor: Optional[str] = None,
         closed: Optional[bool] = False,
+        end_date_min: Optional[str] = None,
+        order: Optional[str] = None,
+        ascending: Optional[bool] = None,
     ) -> tuple[list[dict], Optional[str]]:
         """Fetch a single page of raw market records from GET /markets/keyset.
 
@@ -262,9 +265,16 @@ class PolymarketClient:
         ("keyset") pagination. `offset` is no longer accepted beyond the
         first couple thousand records and returns a 422 if you try to page
         past that point — you must use `after_cursor` from the previous
-        response instead. Note there is also no `active` filter on this
-        endpoint; filter on the `active` field client-side after fetching
-        (see `fetch_all_markets`).
+        response instead.
+
+        There's also no `active` query filter on this endpoint. `active`
+        markets are a subset of non-`closed` ones, but Polymarket's non-closed
+        backlog is enormous (many old/perpetual markets are never formally
+        marked closed), so filtering `active` client-side *after* pulling
+        everything is too slow and pulls way more than you want. Instead,
+        pass `end_date_min` (ISO 8601) to filter server-side on markets that
+        haven't already resolved — that's what actually keeps the result set
+        small — then apply the `active` filter on top of that narrower set.
 
         Returns (markets, next_cursor). `next_cursor` is None on the last page.
         """
@@ -273,6 +283,12 @@ class PolymarketClient:
             params["closed"] = str(closed).lower()
         if after_cursor:
             params["after_cursor"] = after_cursor
+        if end_date_min:
+            params["end_date_min"] = end_date_min
+        if order:
+            params["order"] = order
+        if ascending is not None:
+            params["ascending"] = str(ascending).lower()
 
         data = self._get("/markets/keyset", params=params)
 
@@ -289,23 +305,46 @@ class PolymarketClient:
         closed: Optional[bool] = False,
         page_size: int = 100,
         max_pages: Optional[int] = None,
+        end_date_min: Optional[str] = "now",
+        hard_page_cap: int = 500,
     ) -> list[dict]:
         """Paginate through GET /markets/keyset via cursor until the last page
-        (indicated by a missing `next_cursor`), or until `max_pages` is hit.
+        (indicated by a missing `next_cursor`), `max_pages` is hit, or the
+        `hard_page_cap` safety limit is hit (protects against an unexpectedly
+        enormous result set or an API pagination bug looping forever).
 
-        `active` is applied as a client-side filter after fetching, since the
-        keyset endpoint doesn't expose an `active` query parameter.
+        `end_date_min="now"` (the default) filters server-side to markets
+        that haven't already resolved — this is what keeps the fetch fast
+        and the result set reasonably sized. Pass `end_date_min=None` to
+        disable this and pull the full historical catalog (slow — tens of
+        thousands of records).
+
+        `active` is applied as a client-side filter on top of that, since the
+        keyset endpoint doesn't expose an `active` query parameter directly.
         """
+        if end_date_min == "now":
+            end_date_min = datetime.now(timezone.utc).isoformat()
+
         all_markets: list[dict] = []
         cursor: Optional[str] = None
         page_num = 0
 
         while True:
             page_num += 1
-            logger.info("Fetching markets page %d (cursor=%s, limit=%d)...",
-                        page_num, cursor, page_size)
+            if page_num > hard_page_cap:
+                logger.warning(
+                    "Hit hard_page_cap=%d pages (%d records so far) — stopping early. "
+                    "Pass a smaller max_pages, or narrow with end_date_min/liquidity "
+                    "filters if you expected fewer results.",
+                    hard_page_cap, len(all_markets),
+                )
+                break
+
+            logger.info("Fetching markets page %d (cursor=%s, limit=%d, total so far=%d)...",
+                        page_num, cursor, page_size, len(all_markets))
             page, next_cursor = self.fetch_markets_page(
-                limit=page_size, after_cursor=cursor, closed=closed
+                limit=page_size, after_cursor=cursor, closed=closed,
+                end_date_min=end_date_min,
             )
             if not page:
                 break
@@ -314,8 +353,9 @@ class PolymarketClient:
 
             if max_pages is not None and page_num >= max_pages:
                 break
-            if not next_cursor:
-                # Last page — Gamma omits next_cursor when done.
+            if not next_cursor or next_cursor == cursor:
+                # Last page, or the API handed back the same cursor twice —
+                # treat that as "no more progress" rather than looping forever.
                 break
 
             cursor = next_cursor
@@ -342,10 +382,13 @@ class PolymarketClient:
         closed: Optional[bool] = False,
         page_size: int = 100,
         max_pages: Optional[int] = None,
+        end_date_min: Optional[str] = "now",
+        hard_page_cap: int = 500,
     ) -> list[MarketSnapshot]:
         """Fetch markets and return them as normalized MarketSnapshot objects."""
         raw_markets = self.fetch_all_markets(
-            active=active, closed=closed, page_size=page_size, max_pages=max_pages
+            active=active, closed=closed, page_size=page_size, max_pages=max_pages,
+            end_date_min=end_date_min, hard_page_cap=hard_page_cap,
         )
         snapshots = []
         for rm in raw_markets:
@@ -517,6 +560,14 @@ def main():
     parser.add_argument("--page-size", type=int, default=100)
     parser.add_argument("--max-pages", type=int, default=None,
                          help="Cap the number of pages fetched (useful for testing)")
+    parser.add_argument("--hard-page-cap", type=int, default=500,
+                         help="Safety limit on total pages fetched, regardless of "
+                              "--max-pages, to avoid an accidental runaway fetch "
+                              "(default: 500, i.e. up to 50,000 raw records)")
+    parser.add_argument("--full-history", action="store_true",
+                         help="Disable the end_date_min filter and pull the ENTIRE "
+                              "historical market catalog (tens of thousands of "
+                              "records, many already resolved). Slow — off by default.")
     parser.add_argument("--to-postgres", action="store_true",
                          help="Also write to Postgres (requires DATABASE_URL env var)")
     parser.add_argument("--output-dir", type=str, default=str(DEFAULT_RAW_DIR))
@@ -526,12 +577,15 @@ def main():
 
     active_filter = None if args.include_closed else True
     closed_filter = None if args.include_closed else False
+    end_date_min = None if args.full_history else "now"
 
     markets = client.get_markets(
         active=active_filter,
         closed=closed_filter,
         page_size=args.page_size,
         max_pages=args.max_pages,
+        end_date_min=end_date_min,
+        hard_page_cap=args.hard_page_cap,
     )
 
     if not markets:
