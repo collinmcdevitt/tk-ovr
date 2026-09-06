@@ -58,4 +58,4 @@ Future work includes ensemble models, alternative data, NLP-based information ex
 
 **Collin McDevitt**
 
-Independent quantitative finance and machine-learning research project.
+Independent quantitative finance and machine-learning project.
