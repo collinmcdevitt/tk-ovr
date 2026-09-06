@@ -1,1 +1,40 @@
-.gitignore
+# --- Secrets / environment ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# --- Data (raw/processed data is regenerable from the pipeline; keep it
+#           out of git so the repo stays small and diffs stay clean) ---
+data/raw/*.json
+data/processed/*
+data/samples/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/samples/.gitkeep
+
+# --- Databases ---
+*.db
+*.sqlite3
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Frontend (if/when you add one) ---
+node_modules/
+.next/
+
+# --- OS / editor cruft ---
+.DS_Store
+.vscode/
+.idea/
+*.log
