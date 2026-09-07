@@ -1,7 +1,4 @@
 # tk-ovr
-lets see if this works.         10:12
-
-# tk-ovr
 
 **Quantitative prediction-market alpha engine for detecting and evaluating potential market mispricing.**
 
@@ -47,6 +44,16 @@ The central question behind tk-ovr is:
 > **Can independently estimated probabilities identify persistent differences between prediction-market prices and fair value after accounting for risk, liquidity, and execution costs?**
 
 The project emphasizes out-of-sample testing, probability calibration, realistic backtesting, and reproducible quantitative research.
+
+## Progress
+
+- [x] **Milestone 1 — Data ingestion.** `src/data/polymarket_api.py` pulls markets from Polymarket's Gamma API (cursor-based pagination), normalizes prices/volume/liquidity/resolution-date/status, and persists them as timestamped JSON snapshots and into PostgreSQL (`markets` + `market_snapshots` tables). Currently pulling ~10,000 active, liquid, not-yet-resolved markets per run, filtered and sorted by volume.
+- [ ] **Milestone 2 — Automated/scheduled ingestion.** Run ingestion on a recurring schedule so `market_snapshots` accumulates a real historical time series.
+- [ ] **Milestone 3 — Feature engineering.** Price momentum, rolling volatility, liquidity/volume changes, time-to-resolution features.
+- [ ] **Milestone 4 — Probability models.** Market baseline → historical base rate → logistic regression → gradient boosting → ensemble.
+- [ ] **Milestone 5 — Edge / expected value / calibration.**
+- [ ] **Milestone 6 — Walk-forward backtesting.**
+- [ ] **Milestone 7 — Research dashboard.**
 
 ## Status
 
