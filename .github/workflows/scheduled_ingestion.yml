@@ -1,0 +1,40 @@
+name: Scheduled Market Ingestion
+
+# Runs the Polymarket ingestion pipeline automatically so market_snapshots
+# accumulates a real time series over time (needed for feature engineering
+# and backtesting later — see README Progress section, Milestone 2).
+#
+# Two ways this can run:
+#   1. On a schedule (cron below) — fully automatic.
+#   2. Manually, via the "Run workflow" button on the Actions tab
+#      (workflow_dispatch) — useful for testing without waiting for the cron.
+
+on:
+  schedule:
+    # Every hour, on the hour (UTC). GitHub's cron scheduler is best-effort
+    # and can be delayed a few minutes under load — that's normal and fine
+    # for this use case.
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # safety net: kill the job if it hangs instead of burning Actions minutes
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ingestion
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m src.data.polymarket_api --to-postgres
