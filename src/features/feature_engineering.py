@@ -27,10 +27,10 @@ Design notes:
           this as a model input if you want a feature that behaves
           consistently across the whole probability range.
     - Snapshots don't arrive on perfectly even intervals (ingestion runs on a
-      best-effort hourly cron), so all windowed calculations use precise
-      time-based lookback (see `_lookback_value`), not row-count windows.
-      This is correct regardless of whether your ingestion cadence is
-      hourly, every 15 minutes, or spotty.
+      best-effort hourly cron), so all windowed calculations use pandas'
+      TIME-based rolling windows (e.g. `.rolling("24h")`) keyed off an actual
+      DatetimeIndex, not row-count windows. This is correct regardless of
+      whether your ingestion cadence is hourly, every 15 minutes, or spotty.
     - With few historical snapshots per market, most windowed features will
       legitimately be NaN (e.g. you can't compute 24h volatility from data
       that's only 2 hours old) — that's correct behavior, not a bug. As your
@@ -154,14 +154,16 @@ def compute_features(
         market. Does not need to be pre-sorted or have a unique index.
     resolution_date : the market's scheduled resolution date/time, used to
         compute hours/days_to_resolution. Pass None to skip those columns.
-    as_of : reserved for future use (deterministic "now" in tests).
+    as_of : reference "now" for time-to-resolution calculations. Defaults to
+        the current time — pass an explicit value in tests so results are
+        deterministic.
 
     Returns
     -------
-    A DataFrame with the same number of rows as `snapshots`, with all
-    FEATURE_COLUMNS added. Feature values that can't yet be computed
-    (insufficient history for that window) are NaN — this is expected,
-    not an error.
+    A DataFrame with the same number of rows as `snapshots`, indexed by
+    timestamp, with all FEATURE_COLUMNS added. Feature values that can't yet
+    be computed (insufficient history for that window) are NaN — this is
+    expected, not an error.
     """
     if snapshots.empty:
         return pd.DataFrame(columns=["timestamp"] + FEATURE_COLUMNS)
@@ -175,7 +177,7 @@ def compute_features(
     logit_price = _safe_logit(price)
     returns = price.diff()  # simple period-over-period change, used for volatility
 
-    for label, window in (("1h", "1h"), ("24h", "24h"), ("7d", "7d")):
+    for label, window in (("1h", "1h"), ("24h", "24h"), ("7d", "7D")):
         baseline_price = _lookback_value(price, window)
         df[f"price_change_{label}"] = price - baseline_price
 
@@ -261,7 +263,14 @@ def fetch_market_ids(conn) -> list[str]:
 
 
 def fetch_market_history(conn, market_id: str) -> tuple[pd.DataFrame, Optional[datetime]]:
-    """Returns (snapshot history DataFrame, resolution_date) for one market."""
+    """Returns (snapshot history DataFrame, resolution_date) for one market.
+
+    Uses a plain psycopg2 cursor rather than pandas.read_sql, which — when
+    given a raw DBAPI2 connection instead of a SQLAlchemy engine — emits a
+    UserWarning on every single call. With ~10,000 markets that's ~10,000
+    warnings flooding the terminal, which looks like something is broken
+    even though it isn't. This sidesteps the warning entirely.
+    """
     query = """
         SELECT s.timestamp, s.yes_price, s.volume, s.liquidity, s.spread,
                m.resolution_date
@@ -270,7 +279,12 @@ def fetch_market_history(conn, market_id: str) -> tuple[pd.DataFrame, Optional[d
         WHERE s.market_id = %s
         ORDER BY s.timestamp ASC;
     """
-    df = pd.read_sql(query, conn, params=(market_id,))
+    with conn.cursor() as cur:
+        cur.execute(query, (market_id,))
+        rows = cur.fetchall()
+        colnames = [desc[0] for desc in cur.description]
+
+    df = pd.DataFrame(rows, columns=colnames)
     resolution_date = df["resolution_date"].iloc[0] if not df.empty else None
     return df.drop(columns=["resolution_date"]), resolution_date
 
