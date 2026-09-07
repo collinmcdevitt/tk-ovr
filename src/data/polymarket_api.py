@@ -506,23 +506,47 @@ def ensure_tables(conn) -> None:
     conn.commit()
 
 
-def save_to_postgres(markets: list[MarketSnapshot], dsn: Optional[str] = None) -> None:
+def save_to_postgres(markets: list[MarketSnapshot], dsn: Optional[str] = None,
+                      batch_size: int = 500) -> None:
     """Upsert market metadata and insert a fresh snapshot row for each market.
 
     Uses ON CONFLICT so re-running ingestion is safe (idempotent for
     `markets`; `market_snapshots` gets one new row per run per market, which
     is exactly the time series you want for backtesting).
+
+    Uses psycopg2.extras.execute_values to batch rows into `batch_size`-row
+    statements rather than issuing one round-trip per row — for a few
+    thousand markets, row-by-row inserts mean tens of thousands of
+    network round-trips to a remote database, which is slow. Batching cuts
+    that down by ~batch_size, so 10,000 markets becomes ~20 round-trips
+    instead of ~20,000.
     """
+    from psycopg2.extras import execute_values  # lazy import, same reason as psycopg2 itself
+
     conn = get_pg_connection(dsn)
     try:
         ensure_tables(conn)
+
+        markets_rows = [
+            (m.market_id, m.event_id, m.slug, m.question, m.category,
+             m.created_at, m.resolution_date, m.status)
+            for m in markets
+        ]
+        snapshot_rows = [
+            (m.market_id, m.fetched_at, m.yes_price, m.no_price,
+             m.volume, m.liquidity, m.spread, m.active, m.closed)
+            for m in markets
+        ]
+
         with conn.cursor() as cur:
-            for m in markets:
-                cur.execute(
+            for i in range(0, len(markets_rows), batch_size):
+                batch = markets_rows[i:i + batch_size]
+                execute_values(
+                    cur,
                     """
                     INSERT INTO markets (market_id, event_id, slug, question,
                                           category, created_at, resolution_date, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES %s
                     ON CONFLICT (market_id) DO UPDATE SET
                         event_id = EXCLUDED.event_id,
                         slug = EXCLUDED.slug,
@@ -531,24 +555,27 @@ def save_to_postgres(markets: list[MarketSnapshot], dsn: Optional[str] = None) -
                         resolution_date = EXCLUDED.resolution_date,
                         status = EXCLUDED.status
                     """,
-                    (
-                        m.market_id, m.event_id, m.slug, m.question, m.category,
-                        m.created_at, m.resolution_date, m.status,
-                    ),
+                    batch,
                 )
-                cur.execute(
+                logger.info("Upserted markets batch %d-%d of %d",
+                            i + 1, min(i + batch_size, len(markets_rows)), len(markets_rows))
+
+            for i in range(0, len(snapshot_rows), batch_size):
+                batch = snapshot_rows[i:i + batch_size]
+                execute_values(
+                    cur,
                     """
                     INSERT INTO market_snapshots
                         (market_id, "timestamp", yes_price, no_price, volume,
                          liquidity, spread, active, closed)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES %s
                     ON CONFLICT (market_id, "timestamp") DO NOTHING
                     """,
-                    (
-                        m.market_id, m.fetched_at, m.yes_price, m.no_price,
-                        m.volume, m.liquidity, m.spread, m.active, m.closed,
-                    ),
+                    batch,
                 )
+                logger.info("Inserted snapshot batch %d-%d of %d",
+                            i + 1, min(i + batch_size, len(snapshot_rows)), len(snapshot_rows))
+
         conn.commit()
         logger.info("Upserted %d markets and inserted %d snapshot rows into Postgres.",
                     len(markets), len(markets))
