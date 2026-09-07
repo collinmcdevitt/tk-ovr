@@ -353,7 +353,7 @@ class PolymarketClient:
                         page_num, cursor, page_size, len(all_markets))
             page, next_cursor = self.fetch_markets_page(
                 limit=page_size, after_cursor=cursor, closed=closed,
-                end_date_min=end_date_min, order="volume_num", ascending=False,
+                end_date_min=end_date_min, order="volumeNum", ascending=False,
                 liquidity_num_min=liquidity_num_min, volume_num_min=volume_num_min,
             )
             if not page:
